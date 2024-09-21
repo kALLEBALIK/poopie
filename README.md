@@ -27,7 +27,7 @@ try poopie.collect(allocator, &sampler, .{ .name = "MyBench", .compare_mode = .f
 or compare against a specific file
 ```zig
 try poopie.collect(allocator, &sampler, .{
-    .name = "My bench",
+    .name = "MyBench",
     .compare_mode = .file,
     .compare_file = "MyBench_10_100070223.1_1726867407409043.json",
 });
