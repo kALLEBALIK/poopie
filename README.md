@@ -1,5 +1,5 @@
 # Performance Optimizer Observation Platform Inside Executable
-![bench im](/assets/bm.png)
+![bench im](/assets/bm.png?raw=true)
 ### Usage
 ```zig
     var poopie: Poopie = .{
