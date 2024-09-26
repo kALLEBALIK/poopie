@@ -38,6 +38,7 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
     const all_samples = sampler.samples_buf[0..sampler.sample_config.samples];
     const measurements: Measurements = .{
         .wall_time = Measurement.compute(all_samples, "wall_time", .nanoseconds),
+        .max_rss = Measurement.compute(all_samples, "max_rss", .bytes),
         .cpu_cycles = Measurement.compute(all_samples, "cpu_cycles", .count),
         .instructions = Measurement.compute(all_samples, "instructions", .count),
         .cache_references = Measurement.compute(all_samples, "cache_references", .count),
@@ -133,6 +134,7 @@ pub const Sampler = struct {
     perf_fds: [5]fd_t,
     first_start_ns: u64,
     start_ns: u64,
+    start_rss: u64,
 
     pub fn deinit(self: *Sampler) void {
         self.bar.deinit();
@@ -161,6 +163,7 @@ pub const Sampler = struct {
             .sample_config = sample_config,
             .bar = try progress.ProgressBar.init(allocator, stdout),
             .timer = try std.time.Timer.start(),
+            .start_rss = 0,
         };
     }
 
@@ -173,6 +176,7 @@ pub const Sampler = struct {
         self.start_ns = 0;
         self.started = true;
         self.first_start_ns = self.timer.read();
+        self.start_rss = 0;
     }
 
     /// Start collection of performance data
@@ -209,6 +213,9 @@ pub const Sampler = struct {
             _ = std.os.linux.ioctl(perf_fd.*, PERF.EVENT_IOC.ENABLE, @intFromPtr(perf_fd));
         }
 
+        var rusage: std.os.linux.rusage = undefined;
+        self.start_rss = if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &rusage) == 0) @as(u64, @intCast(rusage.maxrss)) * 1024 else 0;
+
         _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
         _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.ENABLE, PERF.IOC_FLAG_GROUP);
 
@@ -221,6 +228,10 @@ pub const Sampler = struct {
     pub fn store(self: *Sampler) void {
         const end_ns = self.timer.read() - self.start_ns;
         _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
+
+        var rusage: std.os.linux.rusage = undefined;
+        const rss_now = if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &rusage) == 0) @as(u64, @intCast(rusage.maxrss)) * 1024 else 0;
+        const rss = if (rss_now <= self.start_rss) 0 else rss_now - self.start_rss;
 
         // Warmup
         if (self.cur_warmup < self.sample_config.warmups) {
@@ -238,6 +249,7 @@ pub const Sampler = struct {
 
         self.samples_buf[self.cur_sample] = .{
             .wall_time = end_ns,
+            .max_rss = rss,
             .cpu_cycles = readPerfFd(self.perf_fds[0]),
             .instructions = readPerfFd(self.perf_fds[1]),
             .cache_references = readPerfFd(self.perf_fds[2]),
@@ -512,6 +524,7 @@ const perf_measurements = [_]PerfMeasurement{
 
 const Measurements = struct {
     wall_time: Measurement,
+    max_rss: Measurement,
     cpu_cycles: Measurement,
     instructions: Measurement,
     cache_references: Measurement,
@@ -521,6 +534,7 @@ const Measurements = struct {
 
 const Sample = struct {
     wall_time: u64,
+    max_rss: u64,
     cpu_cycles: u64,
     instructions: u64,
     cache_references: u64,
