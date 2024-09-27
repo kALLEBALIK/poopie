@@ -198,9 +198,8 @@ fn readMeasurementFromFile(
     switch (config.compare_mode) {
         .file => {
             if (config.compare_file) |file_name| {
-                var slice = std.mem.sliceTo(file_name, 0);
-                @memcpy(self.read_path_buf[PATH.len .. PATH.len + slice.len], slice[0..]);
-                self.read_path_buf_cursor = PATH.len + slice.len;
+                @memcpy(self.read_path_buf[PATH.len .. PATH.len + file_name.len], file_name[0..]);
+                self.read_path_buf_cursor = PATH.len + file_name.len;
             } else return null;
         },
         .none => {
