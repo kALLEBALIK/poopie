@@ -18,15 +18,15 @@
         // Some code to test
         //
     }
-    try poopie.collect(allocator, &sampler, .{ .name = "MyBench" });
+    _ = try poopie.collect(allocator, &sampler, .{ .name = "MyBench" });
 ```
 You can overwrite poopie settings in each collection if you want
 ```zig
-try poopie.collect(allocator, &sampler, .{ .name = "MyBench", .compare_mode = .fastest });
+_ = try poopie.collect(allocator, &sampler, .{ .name = "MyBench", .compare_mode = .fastest });
 ```
 or compare against a specific file
 ```zig
-try poopie.collect(allocator, &sampler, .{
+_ = try poopie.collect(allocator, &sampler, .{
     .name = "MyBench",
     .compare_mode = .file,
     .compare_file = "MyBench_10_100070223.1_1726867407409043.json",
