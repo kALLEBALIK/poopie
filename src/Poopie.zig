@@ -10,10 +10,11 @@ const progress = @import("./progress.zig");
 
 const MAX_SAMPLES = 30000;
 const PATH = ".benchmarks/";
-/// File name length
-pub const MAX_FILE_NAME_LEN = 256;
-/// File name + path len
-const MAX_PATH_LEN = MAX_FILE_NAME_LEN + PATH.len;
+const EXT = ".json";
+const FILE_NAME_DATA_PADDING = 72;
+pub const MAX_FILE_NAME_LEN = 255;
+/// File name + path len + ext len + padding for file name data
+const MAX_PATH_LEN = MAX_FILE_NAME_LEN + PATH.len + EXT.len + FILE_NAME_DATA_PADDING;
 
 const Poopie = @This();
 
@@ -23,8 +24,11 @@ prints: usize = 0,
 /// Fields can be overridden by
 /// CollectConfig in sampler,
 config: PoopieConfig = .{},
-///
-write_name_buf: [MAX_FILE_NAME_LEN:0]u8 = undefined,
+
+write_name_buf: [MAX_FILE_NAME_LEN + FILE_NAME_DATA_PADDING]u8 = undefined,
+read_path_buf: [MAX_PATH_LEN]u8 = undefined,
+write_name_buf_cursor: usize = 0,
+read_path_buf_cursor: usize = 0,
 
 /// Returns a sampler
 pub fn createSampler(self: Poopie, allocator: Allocator, sample_config: SampleConfig) !Sampler {
@@ -32,14 +36,16 @@ pub fn createSampler(self: Poopie, allocator: Allocator, sample_config: SampleCo
 }
 
 /// Collects results from Sampler, stores and prints the results.
-pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_config: CollectConfig) !void {
+/// Returns slice of the filename if compare_mode == .file
+/// and file_name_out_buffer != null, else returns null.
+pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_config: CollectConfig) !?[]const u8 {
     if (!sampler.started) @panic("Sampler needs to be started before collecting it");
     if (sampler.cur_sample == 0) @panic("No samples collected");
 
     sampler.started = false;
     sampler.resetBar();
 
-    // var return_value_name_len: ?[]const u8 = null;
+    var return_name_slice: ?[]const u8 = null;
     const internal_config = createInternalConfig(self.config, collect_config);
 
     const all_samples = sampler.samples_buf[0..sampler.sample_config.samples];
@@ -53,27 +59,27 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
         .branch_misses = Measurement.compute(all_samples, "branch_misses", .count),
     };
 
+    var bench_count: usize = 1;
+    var maybe_compare_measurement: ?std.json.Parsed(Measurements) = null;
+    defer if (maybe_compare_measurement) |compare_measurement| compare_measurement.deinit();
+
+    if (internal_config.compare_mode != .none and internal_config.print_result) {
+        if (try self.readMeasurementFromFile(allocator, sampler.sample_config.samples, internal_config)) |compare_measurement| {
+            bench_count += 1;
+            maybe_compare_measurement = compare_measurement;
+        }
+    }
+
     if (internal_config.store_result) {
-        const buf = try writeMeasurementsToFile(allocator, &self.write_name_buf, measurements, internal_config);
+        try self.writeMeasurementsToFile(allocator, measurements, internal_config);
         if (internal_config.file_name_out_buffer) |out_buffer| {
-            if (out_buffer.len < buf.len) @panic("Too small name buffer");
-            @memcpy(out_buffer[0..buf.len], buf[0..]);
+            @memcpy(out_buffer[0..self.write_name_buf_cursor], self.write_name_buf[0..self.write_name_buf_cursor]);
+            return_name_slice = out_buffer[0..self.write_name_buf_cursor];
         }
     }
 
     if (internal_config.print_result) {
         defer self.prints += 1;
-
-        var bench_count: usize = 1;
-        var maybe_compare_measurement: ?std.json.Parsed(Measurements) = null;
-        defer if (maybe_compare_measurement) |compare_measurement| compare_measurement.deinit();
-
-        if (internal_config.compare_mode == .file) {
-            if (try getMeasurementsFromFile(allocator, sampler.sample_config.samples, internal_config)) |compare_measurement| {
-                bench_count += 1;
-                maybe_compare_measurement = compare_measurement;
-            }
-        }
 
         var stdout = std.io.getStdOut();
         var stdout_bw = std.io.bufferedWriter(stdout.writer());
@@ -93,11 +99,8 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
                 const measurement = @field(compare_measurement.value, field.name);
                 try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, null, 1);
             }
-            if (internal_config.compare_mode == .file) {
-                if (internal_config.compare_file) |compare_file| {
-                    const slice = std.mem.sliceTo(compare_file, 0);
-                    try printFileName(sampler.tty_conf, stdout_w, "In: ", slice);
-                }
+            if (internal_config.compare_mode != .none) {
+                try printFileName(sampler.tty_conf, stdout_w, "In: ", self.read_path_buf[PATH.len..self.read_path_buf_cursor]);
             }
             try stdout_w.writeAll("\n");
         }
@@ -111,11 +114,12 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
             try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, first_measurement, bench_count);
         }
         if (internal_config.store_result) {
-            const slice = std.mem.sliceTo(&self.write_name_buf, 0);
-            try printFileName(sampler.tty_conf, stdout_w, "Out: ", slice);
+            try printFileName(sampler.tty_conf, stdout_w, "Out: ", self.write_name_buf[0..self.write_name_buf_cursor]);
         }
         try stdout_bw.flush();
     }
+
+    return return_name_slice;
 }
 
 fn createInternalConfig(poopie_config: PoopieConfig, collect_config: CollectConfig) CollectConfigInternal {
@@ -139,7 +143,132 @@ fn createInternalConfig(poopie_config: PoopieConfig, collect_config: CollectConf
             }
         }
     }
+    if (internal.name.len > MAX_FILE_NAME_LEN)
+        std.debug.panic("Too long name, max length is: {}", .{MAX_FILE_NAME_LEN});
+
     return internal;
+}
+
+fn writeMeasurementsToFile(
+    self: *Poopie,
+    allocator: Allocator,
+    measurements: Measurements,
+    config: CollectConfigInternal,
+) !void {
+    if (std.mem.indexOf(u8, config.name, "_") != null) @panic("Name can't contain an underscore '_'.");
+
+    var string = std.ArrayList(u8).init(allocator);
+    defer string.deinit();
+
+    _ = try std.json.stringify(measurements, .{}, string.writer());
+
+    std.fs.cwd().makeDir(PATH) catch |err|
+        if (err != error.PathAlreadyExists) return err;
+
+    var dir = try std.fs.cwd().openDir(PATH, .{});
+    defer dir.close();
+
+    const file_name = try std.fmt.bufPrint(&self.write_name_buf, "{s}_{d}_{d}_{d}.json", .{
+        config.name,
+        measurements.wall_time.sample_count,
+        measurements.wall_time.mean,
+        std.time.microTimestamp(),
+    });
+    self.write_name_buf_cursor = file_name.len;
+
+    var file = try dir.createFile(file_name, .{});
+    defer file.close();
+    try file.writer().writeAll(string.items);
+}
+
+fn readMeasurementFromFile(
+    self: *Poopie,
+    allocator: Allocator,
+    samples: usize,
+    config: CollectConfigInternal,
+) !?std.json.Parsed(Measurements) {
+    if (config.compare_mode == .none)
+        return null;
+
+    @memcpy(self.read_path_buf[0..PATH.len], PATH[0..PATH.len]);
+
+    switch (config.compare_mode) {
+        .file => {
+            if (config.compare_file) |file_name| {
+                var slice = std.mem.sliceTo(file_name, 0);
+                @memcpy(self.read_path_buf[PATH.len .. PATH.len + slice.len], slice[0..]);
+                self.read_path_buf_cursor = PATH.len + slice.len;
+            } else return null;
+        },
+        .none => {
+            return null;
+        },
+        else => {
+            var compare: i64 = switch (config.compare_mode) {
+                .oldest => std.math.maxInt(i64),
+                .fastest => @bitCast(std.math.floatMax(f64)),
+                else => 0,
+            };
+
+            var dir = std.fs.cwd().openDir(PATH, .{ .iterate = true }) catch |err| {
+                if (err == error.FileNotFound) return null;
+                return err;
+            };
+
+            var dir_iter = dir.iterate();
+            while (try dir_iter.next()) |file| {
+                var data: FileNameData = undefined;
+                try parseFileName(file.name, &data);
+                if (!std.mem.eql(u8, data.extension, EXT)) @panic("Invalid file extension");
+                if (std.mem.eql(u8, data.name, config.name) and data.samples == samples) {
+                    switch (config.compare_mode) {
+                        .fastest => {
+                            if (data.wall_time < @as(f64, @bitCast(compare))) {
+                                compare = @bitCast(data.wall_time);
+                                @memcpy(self.read_path_buf[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                self.read_path_buf_cursor = file.name.len + PATH.len;
+                            }
+                        },
+                        .slowest => {
+                            if (data.wall_time > @as(f64, @bitCast(compare))) {
+                                compare = @bitCast(data.wall_time);
+                                @memcpy(self.read_path_buf[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                self.read_path_buf_cursor = file.name.len + PATH.len;
+                            }
+                        },
+                        .latest => {
+                            if (data.time_stamp > compare) {
+                                compare = data.time_stamp;
+                                @memcpy(self.read_path_buf[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                self.read_path_buf_cursor = file.name.len + PATH.len;
+                            }
+                        },
+                        .oldest => {
+                            if (data.time_stamp < compare) {
+                                compare = data.time_stamp;
+                                @memcpy(self.read_path_buf[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                self.read_path_buf_cursor = file.name.len + PATH.len;
+                            }
+                        },
+                        .file, .none => unreachable,
+                    }
+                }
+            }
+        },
+    }
+
+    if (self.read_path_buf_cursor == 0)
+        return null;
+
+    const file_name = self.read_path_buf[0..self.read_path_buf_cursor];
+    const stat = try std.fs.cwd().statFile(file_name);
+    const file_buffer = try allocator.alloc(u8, stat.size);
+    defer allocator.free(file_buffer);
+
+    var file = try std.fs.cwd().openFile(file_name, .{});
+    defer file.close();
+    _ = try file.readAll(file_buffer);
+    return try std.json.parseFromSlice(Measurements, allocator, file_buffer, .{});
 }
 
 pub const Sampler = struct {
@@ -355,7 +484,7 @@ pub const CollectConfig = struct {
     compare_mode: ?CompareMode = null,
     /// Specific file to compare against
     /// only used if compare_mode is .file
-    compare_file: ?[:0]const u8 = null,
+    compare_file: ?[]const u8 = null,
     /// out buffer for file name
     file_name_out_buffer: ?[]u8 = null,
     /// name of benchmark
@@ -366,7 +495,7 @@ const CollectConfigInternal = struct {
     store_result: bool = false,
     print_result: bool = true,
     compare_mode: CompareMode = .fastest,
-    compare_file: ?[:0]const u8 = null,
+    compare_file: ?[]const u8 = null,
     file_name_out_buffer: ?[]u8 = null,
     name: []const u8,
 };
@@ -391,137 +520,11 @@ fn printFileName(
     try w.writeAll("\n");
 }
 
-/// Returns slice including sentinel
-fn writeMeasurementsToFile(
-    allocator: Allocator,
-    name_buf: []u8,
-    measurements: Measurements,
-    config: CollectConfigInternal,
-) ![]const u8 {
-    if (std.mem.indexOf(u8, config.name, "_") != null) @panic("Name can't contain an underscore '_'.");
-
-    var string = std.ArrayList(u8).init(allocator);
-    defer string.deinit();
-
-    _ = try std.json.stringify(measurements, .{}, string.writer());
-
-    std.fs.cwd().makeDir(PATH) catch |err|
-        if (err != error.PathAlreadyExists) return err;
-
-    var dir = try std.fs.cwd().openDir(PATH, .{});
-    defer dir.close();
-
-    const file_name = try std.fmt.bufPrintZ(name_buf, "{s}_{d}_{d}_{d}.json", .{
-        config.name,
-        measurements.wall_time.sample_count,
-        measurements.wall_time.mean,
-        std.time.microTimestamp(),
-    });
-
-    var file = try dir.createFileZ(file_name, .{});
-    defer file.close();
-    try file.writer().writeAll(string.items);
-
-    return name_buf[0 .. file_name.len + 1];
-}
-
-fn getMeasurementsFromFile(
-    allocator: Allocator,
-    samples: usize,
-    config: CollectConfigInternal,
-) !?std.json.Parsed(Measurements) {
-    if (config.compare_mode == .none)
-        return null;
-
-    var name_buffer: [MAX_PATH_LEN]u8 = undefined;
-    @memcpy(name_buffer[0..PATH.len], PATH[0..PATH.len]);
-    var name_buffer_cursor: usize = 0;
-
-    switch (config.compare_mode) {
-        .file => {
-            if (config.compare_file) |file_name| {
-                var slice = std.mem.sliceTo(file_name, 0);
-                @memcpy(name_buffer[PATH.len .. PATH.len + slice.len], slice[0..]);
-                name_buffer_cursor = PATH.len + slice.len;
-            } else return null;
-        },
-        .none => {
-            return null;
-        },
-        else => {
-            var compare: i64 = switch (config.compare_mode) {
-                .oldest => std.math.maxInt(i64),
-                .fastest => @bitCast(std.math.floatMax(f64)),
-                else => 0,
-            };
-
-            var dir = std.fs.cwd().openDir(PATH, .{ .iterate = true }) catch |err| {
-                if (err == error.FileNotFound) return null;
-                return err;
-            };
-
-            var dir_iter = dir.iterate();
-            while (try dir_iter.next()) |file| {
-                var data: FileNameData = undefined;
-                try parseFileName(file.name, &data);
-                if (!std.mem.eql(u8, data.extension, "json")) @panic("Invalid file extension");
-                if (std.mem.eql(u8, data.name, config.name) and data.samples == samples) {
-                    switch (config.compare_mode) {
-                        .fastest => {
-                            if (data.wall_time < @as(f64, @bitCast(compare))) {
-                                compare = @bitCast(data.wall_time);
-                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + PATH.len;
-                            }
-                        },
-                        .slowest => {
-                            if (data.wall_time > @as(f64, @bitCast(compare))) {
-                                compare = @bitCast(data.wall_time);
-                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + PATH.len;
-                            }
-                        },
-                        .latest => {
-                            if (data.time_stamp > compare) {
-                                compare = data.time_stamp;
-                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + PATH.len;
-                            }
-                        },
-                        .oldest => {
-                            if (data.time_stamp < compare) {
-                                compare = data.time_stamp;
-                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + PATH.len;
-                            }
-                        },
-                        .file, .none => unreachable,
-                    }
-                }
-            }
-        },
-    }
-
-    if (name_buffer_cursor == 0)
-        return null;
-
-    const file_name = name_buffer[0..name_buffer_cursor];
-    const stat = try std.fs.cwd().statFile(file_name);
-    const file_buffer = try allocator.alloc(u8, stat.size);
-    defer allocator.free(file_buffer);
-
-    var file = try std.fs.cwd().openFile(file_name, .{});
-    defer file.close();
-    _ = try file.readAll(file_buffer);
-
-    return try std.json.parseFromSlice(Measurements, allocator, file_buffer, .{});
-}
-
 fn parseFileName(file_name: []const u8, data: *FileNameData) !void {
-    if (file_name.len < "json".len) @panic("Invalid file name.");
-    const ext = file_name[file_name.len - "json".len .. file_name.len];
+    if (file_name.len < EXT.len) @panic("Invalid file name.");
+    const ext = file_name[file_name.len - EXT.len .. file_name.len];
     data.extension = ext;
-    var token_iter = std.mem.tokenizeScalar(u8, file_name[0 .. file_name.len - ".json".len], '_');
+    var token_iter = std.mem.tokenizeScalar(u8, file_name[0 .. file_name.len - EXT.len], '_');
     var curr_token: usize = 0;
     while (token_iter.next()) |token| {
         switch (curr_token) {
