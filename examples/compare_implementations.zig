@@ -8,7 +8,6 @@ pub fn main() !void {
     var poopie: Poopie = .{
         .config = .{
             .store_result = true,
-            .compare_mode = .slowest,
         },
     };
 
