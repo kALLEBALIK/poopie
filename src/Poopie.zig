@@ -9,7 +9,11 @@ const assert = std.debug.assert;
 const progress = @import("./progress.zig");
 
 const MAX_SAMPLES = 30000;
-const MAX_FILE_NAME_LEN = 256;
+const PATH = ".benchmarks/";
+/// File name length
+pub const MAX_FILE_NAME_LEN = 256;
+/// File name + path len
+const MAX_PATH_LEN = MAX_FILE_NAME_LEN + PATH.len;
 
 const Poopie = @This();
 
@@ -19,6 +23,8 @@ prints: usize = 0,
 /// Fields can be overridden by
 /// CollectConfig in sampler,
 config: PoopieConfig = .{},
+///
+write_name_buf: [MAX_FILE_NAME_LEN:0]u8 = undefined,
 
 /// Returns a sampler
 pub fn createSampler(self: Poopie, allocator: Allocator, sample_config: SampleConfig) !Sampler {
@@ -33,6 +39,7 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
     sampler.started = false;
     sampler.resetBar();
 
+    // var return_value_name_len: ?[]const u8 = null;
     const internal_config = createInternalConfig(self.config, collect_config);
 
     const all_samples = sampler.samples_buf[0..sampler.sample_config.samples];
@@ -45,6 +52,14 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
         .cache_misses = Measurement.compute(all_samples, "cache_misses", .count),
         .branch_misses = Measurement.compute(all_samples, "branch_misses", .count),
     };
+
+    if (internal_config.store_result) {
+        const buf = try writeMeasurementsToFile(allocator, &self.write_name_buf, measurements, internal_config);
+        if (internal_config.file_name_out_buffer) |out_buffer| {
+            if (out_buffer.len < buf.len) @panic("Too small name buffer");
+            @memcpy(out_buffer[0..buf.len], buf[0..]);
+        }
+    }
 
     if (internal_config.print_result) {
         defer self.prints += 1;
@@ -73,9 +88,16 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
 
         if (maybe_compare_measurement) |compare_measurement| {
             try printMeasurementHeader(sampler.tty_conf, stdout_w, sampler.sample_config.samples, internal_config, bench_count, false);
+
             inline for (@typeInfo(Measurements).Struct.fields) |field| {
                 const measurement = @field(compare_measurement.value, field.name);
                 try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, null, 1);
+            }
+            if (internal_config.compare_mode == .file) {
+                if (internal_config.compare_file) |compare_file| {
+                    const slice = std.mem.sliceTo(compare_file, 0);
+                    try printFileName(sampler.tty_conf, stdout_w, "In: ", slice);
+                }
             }
             try stdout_w.writeAll("\n");
         }
@@ -88,12 +110,11 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
             } else null;
             try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, first_measurement, bench_count);
         }
-
+        if (internal_config.store_result) {
+            const slice = std.mem.sliceTo(&self.write_name_buf, 0);
+            try printFileName(sampler.tty_conf, stdout_w, "Out: ", slice);
+        }
         try stdout_bw.flush();
-    }
-
-    if (internal_config.store_result) {
-        try writeMeasurementsToFile(allocator, measurements, internal_config);
     }
 }
 
@@ -334,7 +355,9 @@ pub const CollectConfig = struct {
     compare_mode: ?CompareMode = null,
     /// Specific file to compare against
     /// only used if compare_mode is .file
-    compare_file: ?[]const u8 = null,
+    compare_file: ?[:0]const u8 = null,
+    /// out buffer for file name
+    file_name_out_buffer: ?[]u8 = null,
     /// name of benchmark
     name: []const u8,
 };
@@ -343,7 +366,8 @@ const CollectConfigInternal = struct {
     store_result: bool = false,
     print_result: bool = true,
     compare_mode: CompareMode = .fastest,
-    compare_file: ?[]const u8 = null,
+    compare_file: ?[:0]const u8 = null,
+    file_name_out_buffer: ?[]u8 = null,
     name: []const u8,
 };
 
@@ -355,11 +379,25 @@ const FileNameData = struct {
     time_stamp: i64,
 };
 
+fn printFileName(
+    tty_conf: std.io.tty.Config,
+    w: anytype,
+    pre: []const u8,
+    name: []const u8,
+) !void {
+    try tty_conf.setColor(w, .dim);
+    try w.print("  {s} {s}", .{ pre, name });
+    try tty_conf.setColor(w, .reset);
+    try w.writeAll("\n");
+}
+
+/// Returns slice including sentinel
 fn writeMeasurementsToFile(
     allocator: Allocator,
+    name_buf: []u8,
     measurements: Measurements,
     config: CollectConfigInternal,
-) !void {
+) ![]const u8 {
     if (std.mem.indexOf(u8, config.name, "_") != null) @panic("Name can't contain an underscore '_'.");
 
     var string = std.ArrayList(u8).init(allocator);
@@ -367,23 +405,24 @@ fn writeMeasurementsToFile(
 
     _ = try std.json.stringify(measurements, .{}, string.writer());
 
-    std.fs.cwd().makeDir(".benchmarks") catch |err|
+    std.fs.cwd().makeDir(PATH) catch |err|
         if (err != error.PathAlreadyExists) return err;
 
-    var dir = try std.fs.cwd().openDir(".benchmarks", .{});
+    var dir = try std.fs.cwd().openDir(PATH, .{});
     defer dir.close();
 
-    const file_name = try std.fmt.allocPrintZ(allocator, "{s}_{d}_{d}_{d}.json", .{
+    const file_name = try std.fmt.bufPrintZ(name_buf, "{s}_{d}_{d}_{d}.json", .{
         config.name,
         measurements.wall_time.sample_count,
         measurements.wall_time.mean,
         std.time.microTimestamp(),
     });
-    defer allocator.free(file_name);
 
     var file = try dir.createFileZ(file_name, .{});
     defer file.close();
     try file.writer().writeAll(string.items);
+
+    return name_buf[0 .. file_name.len + 1];
 }
 
 fn getMeasurementsFromFile(
@@ -394,16 +433,16 @@ fn getMeasurementsFromFile(
     if (config.compare_mode == .none)
         return null;
 
-    const path = ".benchmarks/";
-    var name_buffer: [MAX_FILE_NAME_LEN + path.len]u8 = undefined;
-    @memcpy(name_buffer[0..path.len], path[0..path.len]);
+    var name_buffer: [MAX_PATH_LEN]u8 = undefined;
+    @memcpy(name_buffer[0..PATH.len], PATH[0..PATH.len]);
     var name_buffer_cursor: usize = 0;
 
     switch (config.compare_mode) {
         .file => {
             if (config.compare_file) |file_name| {
-                @memcpy(name_buffer[path.len .. path.len + file_name.len], file_name[0..]);
-                name_buffer_cursor = path.len + file_name.len;
+                var slice = std.mem.sliceTo(file_name, 0);
+                @memcpy(name_buffer[PATH.len .. PATH.len + slice.len], slice[0..]);
+                name_buffer_cursor = PATH.len + slice.len;
             } else return null;
         },
         .none => {
@@ -416,7 +455,7 @@ fn getMeasurementsFromFile(
                 else => 0,
             };
 
-            var dir = std.fs.cwd().openDir(".benchmarks", .{ .iterate = true }) catch |err| {
+            var dir = std.fs.cwd().openDir(PATH, .{ .iterate = true }) catch |err| {
                 if (err == error.FileNotFound) return null;
                 return err;
             };
@@ -431,29 +470,29 @@ fn getMeasurementsFromFile(
                         .fastest => {
                             if (data.wall_time < @as(f64, @bitCast(compare))) {
                                 compare = @bitCast(data.wall_time);
-                                @memcpy(name_buffer[path.len .. path.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + path.len;
+                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                name_buffer_cursor = file.name.len + PATH.len;
                             }
                         },
                         .slowest => {
                             if (data.wall_time > @as(f64, @bitCast(compare))) {
                                 compare = @bitCast(data.wall_time);
-                                @memcpy(name_buffer[path.len .. path.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + path.len;
+                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                name_buffer_cursor = file.name.len + PATH.len;
                             }
                         },
                         .latest => {
                             if (data.time_stamp > compare) {
                                 compare = data.time_stamp;
-                                @memcpy(name_buffer[path.len .. path.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + path.len;
+                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                name_buffer_cursor = file.name.len + PATH.len;
                             }
                         },
                         .oldest => {
                             if (data.time_stamp < compare) {
                                 compare = data.time_stamp;
-                                @memcpy(name_buffer[path.len .. path.len + file.name.len], file.name[0..file.name.len]);
-                                name_buffer_cursor = file.name.len + path.len;
+                                @memcpy(name_buffer[PATH.len .. PATH.len + file.name.len], file.name[0..file.name.len]);
+                                name_buffer_cursor = file.name.len + PATH.len;
                             }
                         },
                         .file, .none => unreachable,
