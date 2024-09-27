@@ -53,7 +53,7 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
         var maybe_compare_measurement: ?std.json.Parsed(Measurements) = null;
         defer if (maybe_compare_measurement) |compare_measurement| compare_measurement.deinit();
 
-        if (internal_config.compare_mode != .none) {
+        if (internal_config.compare_mode == .file) {
             if (try getMeasurementsFromFile(allocator, sampler.sample_config.samples, internal_config)) |compare_measurement| {
                 bench_count += 1;
                 maybe_compare_measurement = compare_measurement;
