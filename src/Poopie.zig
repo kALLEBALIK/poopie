@@ -116,6 +116,9 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
         if (internal_config.store_result) {
             try printFileName(sampler.tty_conf, stdout_w, "Out: ", self.write_name_buf[0..self.write_name_buf_cursor]);
         }
+        if (internal_config.compare_mode != .none and maybe_compare_measurement == null) {
+            try printFileName(sampler.tty_conf, stdout_w, "", "Comparison file not found");
+        }
         try stdout_bw.flush();
     }
 
@@ -515,7 +518,7 @@ fn printFileName(
     name: []const u8,
 ) !void {
     try tty_conf.setColor(w, .dim);
-    try w.print("  {s} {s}", .{ pre, name });
+    try w.print("  {s}{s}", .{ pre, name });
     try tty_conf.setColor(w, .reset);
     try w.writeAll("\n");
 }
