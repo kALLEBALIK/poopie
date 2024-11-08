@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const File = std.fs.File;
 const BufferedWriter = std.io.BufferedWriter;
@@ -49,24 +50,38 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
     const internal_config = createInternalConfig(self.config, collect_config);
 
     const all_samples = sampler.samples_buf[0..sampler.sample_config.samples];
-    const measurements: Measurements = .{
-        .wall_time = Measurement.compute(all_samples, "wall_time", .nanoseconds),
-        .max_rss = Measurement.compute(all_samples, "max_rss", .bytes),
-        .cpu_cycles = Measurement.compute(all_samples, "cpu_cycles", .count),
-        .instructions = Measurement.compute(all_samples, "instructions", .count),
-        .cache_references = Measurement.compute(all_samples, "cache_references", .count),
-        .cache_misses = Measurement.compute(all_samples, "cache_misses", .count),
-        .branch_misses = Measurement.compute(all_samples, "branch_misses", .count),
-    };
+    const measurements = Measurements.computeSamples(all_samples);
 
+    var local_prints: u1 = 0;
     var bench_count: usize = 1;
-    var maybe_compare_measurement: ?std.json.Parsed(Measurements) = null;
-    defer if (maybe_compare_measurement) |compare_measurement| compare_measurement.deinit();
+    var maybe_compare_measurement: ?Measurements = null;
 
-    if (internal_config.compare_mode != .none and internal_config.print_result) {
-        if (try self.readMeasurementFromFile(allocator, sampler.sample_config.samples, internal_config)) |compare_measurement| {
-            bench_count += 1;
-            maybe_compare_measurement = compare_measurement;
+    if (internal_config.print_result) {
+        switch (internal_config.compare_mode) {
+            .none => {},
+            .sampler => {
+                if (internal_config.compare_sampler) |s| {
+                    if (s.sample_config.samples != sampler.sample_config.samples or
+                        s.sample_config.warmups != sampler.sample_config.warmups)
+                    {
+                        @panic("Warmup and/or samples does not match");
+                    }
+                    bench_count += 1;
+                    const compare_samples = s.samples_buf[0..s.sample_config.samples];
+                    maybe_compare_measurement = Measurements.computeSamples(compare_samples);
+                }
+            },
+            .fastest, .slowest, .latest, .oldest, .file => {
+                if (try self.readMeasurementFromFile(
+                    allocator,
+                    sampler.sample_config.samples,
+                    internal_config,
+                )) |compare_measurement| {
+                    bench_count += 1;
+                    maybe_compare_measurement = compare_measurement.value;
+                    compare_measurement.deinit();
+                }
+            },
         }
     }
 
@@ -92,31 +107,56 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
             }
         }
 
+        // Compare measurements
         if (maybe_compare_measurement) |compare_measurement| {
-            try printMeasurementHeader(sampler.tty_conf, stdout_w, sampler.sample_config.samples, internal_config, bench_count, false);
+            defer local_prints += 1;
+            try printMeasurementHeader(
+                sampler.tty_conf,
+                stdout_w,
+                sampler.sample_config.samples,
+                internal_config,
+                bench_count,
+                false,
+                local_prints,
+            );
 
             inline for (@typeInfo(Measurements).Struct.fields) |field| {
-                const measurement = @field(compare_measurement.value, field.name);
+                const measurement = @field(compare_measurement, field.name);
                 try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, null, 1);
             }
-            if (internal_config.compare_mode != .none) {
+            if (CompareMode.accessesFile(internal_config.compare_mode)) {
                 try printFileName(sampler.tty_conf, stdout_w, "In: ", self.read_path_buf[PATH.len..self.read_path_buf_cursor]);
+            } else if (internal_config.compare_mode == .sampler) {
+                if (internal_config.compare_sampler) |_| {
+                    try printFileName(sampler.tty_conf, stdout_w, "In: ", "Sampler");
+                } else {
+                    try printFileName(sampler.tty_conf, stdout_w, "In: ", "Sampler not found.");
+                }
             }
             try stdout_w.writeAll("\n");
         }
 
-        try printMeasurementHeader(sampler.tty_conf, stdout_w, sampler.sample_config.samples, internal_config, bench_count, maybe_compare_measurement != null);
+        // This measurements
+        try printMeasurementHeader(
+            sampler.tty_conf,
+            stdout_w,
+            sampler.sample_config.samples,
+            internal_config,
+            bench_count,
+            maybe_compare_measurement != null,
+            local_prints,
+        );
         inline for (@typeInfo(Measurements).Struct.fields) |field| {
             const measurement = @field(measurements, field.name);
             const first_measurement = if (maybe_compare_measurement) |compare_measurement| blk: {
-                break :blk @field(compare_measurement.value, field.name);
+                break :blk @field(compare_measurement, field.name);
             } else null;
             try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, first_measurement, bench_count);
         }
         if (internal_config.store_result) {
             try printFileName(sampler.tty_conf, stdout_w, "Out: ", self.write_name_buf[0..self.write_name_buf_cursor]);
         }
-        if (internal_config.compare_mode != .none and maybe_compare_measurement == null) {
+        if (CompareMode.accessesFile(internal_config.compare_mode) and maybe_compare_measurement == null) {
             try printFileName(sampler.tty_conf, stdout_w, "", "Comparison file not found");
         }
         try stdout_bw.flush();
@@ -202,8 +242,10 @@ fn readMeasurementFromFile(
                 self.read_path_buf_cursor = PATH.len + file_name.len;
             } else return null;
         },
-        .none => {
-            return null;
+        .none,
+        .sampler,
+        => |m| {
+            std.debug.panic("Trying to read measurements from file when compare mode is {any}", .{m});
         },
         else => {
             var compare: i64 = switch (config.compare_mode) {
@@ -252,7 +294,7 @@ fn readMeasurementFromFile(
                                 self.read_path_buf_cursor = file.name.len + PATH.len;
                             }
                         },
-                        .file, .none => unreachable,
+                        .file, .none, .sampler => unreachable,
                     }
                 }
             }
@@ -264,7 +306,8 @@ fn readMeasurementFromFile(
 
     const file_name = self.read_path_buf[0..self.read_path_buf_cursor];
     const stat = try std.fs.cwd().statFile(file_name);
-    const file_buffer = try allocator.alloc(u8, stat.size);
+    //                                          to make x86 work
+    const file_buffer = try allocator.alloc(u8, @intCast(stat.size));
     defer allocator.free(file_buffer);
 
     var file = try std.fs.cwd().openFile(file_name, .{});
@@ -457,6 +500,14 @@ pub const CompareMode = enum {
     latest,
     oldest,
     file,
+    sampler,
+
+    pub fn accessesFile(cm: CompareMode) bool {
+        return switch (cm) {
+            .none, .sampler => false,
+            .fastest, .slowest, .latest, .oldest, .file => true,
+        };
+    }
 };
 
 pub const SampleConfig = struct {
@@ -487,6 +538,8 @@ pub const CollectConfig = struct {
     /// Specific file to compare against
     /// only used if compare_mode is .file
     compare_file: ?[]const u8 = null,
+    /// compare against an other sampler
+    compare_sampler: ?*Sampler = null,
     /// out buffer for file name
     file_name_out_buffer: ?[]u8 = null,
     /// name of benchmark
@@ -498,6 +551,7 @@ const CollectConfigInternal = struct {
     print_result: bool = true,
     compare_mode: CompareMode = .fastest,
     compare_file: ?[]const u8 = null,
+    compare_sampler: ?*Sampler = null,
     file_name_out_buffer: ?[]u8 = null,
     name: []const u8,
 };
@@ -547,7 +601,11 @@ fn parseFileName(file_name: []const u8, data: *FileNameData) !void {
 fn readPerfFd(fd: fd_t) usize {
     var result: usize = 0;
     const n = std.posix.read(fd, std.mem.asBytes(&result)) catch |err| {
-        std.debug.panic("unable to read perf fd: {s}\n", .{@errorName(err)});
+        if (builtin.mode == .Debug) {
+            std.debug.panic("unable to read perf fd: {s}\n", .{@errorName(err)});
+        } else {
+            return 0;
+        }
     };
     assert(n == @sizeOf(usize));
     return result;
@@ -574,6 +632,18 @@ const Measurements = struct {
     cache_references: Measurement,
     cache_misses: Measurement,
     branch_misses: Measurement,
+
+    pub fn computeSamples(samples: []Sample) Measurements {
+        return .{
+            .wall_time = Measurement.compute(samples, "wall_time", .nanoseconds),
+            .max_rss = Measurement.compute(samples, "max_rss", .bytes),
+            .cpu_cycles = Measurement.compute(samples, "cpu_cycles", .count),
+            .instructions = Measurement.compute(samples, "instructions", .count),
+            .cache_references = Measurement.compute(samples, "cache_references", .count),
+            .cache_misses = Measurement.compute(samples, "cache_misses", .count),
+            .branch_misses = Measurement.compute(samples, "branch_misses", .count),
+        };
+    }
 };
 
 const Sample = struct {
@@ -679,11 +749,15 @@ fn printMeasurementHeader(
     config: CollectConfigInternal,
     bench_count: usize,
     show_delta: bool,
+    order: u1,
 ) !void {
     const stdout_w = w;
-
     try tty_conf.setColor(stdout_w, .bold);
-    try stdout_w.print("Benchmark {s}", .{config.name});
+    if (order == 0 and config.compare_mode == .sampler) {
+        try stdout_w.print("Benchmark Sampler", .{});
+    } else {
+        try stdout_w.print("Benchmark {s}", .{config.name});
+    }
     try tty_conf.setColor(stdout_w, .dim);
     if (bench_count > 1 and !show_delta and config.compare_mode != .none)
         try stdout_w.print(" {s} run", .{@tagName(config.compare_mode)});
