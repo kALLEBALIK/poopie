@@ -56,6 +56,10 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
     var bench_count: usize = 1;
     var maybe_compare_measurement: ?Measurements = null;
 
+    if (internal_config.out_measurments) |out_measurments| {
+        out_measurments.* = measurements;
+    }
+
     if (internal_config.print_result) {
         switch (internal_config.compare_mode) {
             .none => {},
@@ -165,7 +169,7 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
     return return_name_slice;
 }
 
-fn createInternalConfig(poopie_config: PoopieConfig, collect_config: CollectConfig) CollectConfigInternal {
+pub fn createInternalConfig(poopie_config: PoopieConfig, collect_config: CollectConfig) CollectConfigInternal {
     var internal: CollectConfigInternal = .{
         .compare_file = collect_config.compare_file,
         .name = collect_config.name,
@@ -200,10 +204,8 @@ fn writeMeasurementsToFile(
 ) !void {
     if (std.mem.indexOf(u8, config.name, "_") != null) @panic("Name can't contain an underscore '_'.");
 
-    var string = std.ArrayList(u8).init(allocator);
+    var string = try measurementsToJson(allocator, measurements);
     defer string.deinit();
-
-    _ = try std.json.stringify(measurements, .{}, string.writer());
 
     std.fs.cwd().makeDir(PATH) catch |err|
         if (err != error.PathAlreadyExists) return err;
@@ -305,6 +307,16 @@ fn readMeasurementFromFile(
         return null;
 
     const file_name = self.read_path_buf[0..self.read_path_buf_cursor];
+    return try readMeasurementFromFileName(allocator, file_name);
+}
+
+pub fn measurementsToJson(allocator: Allocator, measurements: Measurements) !std.ArrayList(u8) {
+    var string = std.ArrayList(u8).init(allocator);
+    _ = try std.json.stringify(measurements, .{}, string.writer());
+    return string;
+}
+
+pub fn readMeasurementFromFileName(allocator: Allocator, file_name: []const u8) !?std.json.Parsed(Measurements) {
     const stat = try std.fs.cwd().statFile(file_name);
     //                                          to make x86 work
     const file_buffer = try allocator.alloc(u8, @intCast(stat.size));
@@ -542,6 +554,8 @@ pub const CollectConfig = struct {
     compare_sampler: ?*Sampler = null,
     /// out buffer for file name
     file_name_out_buffer: ?[]u8 = null,
+    /// out measurements
+    out_measurments: ?*Measurements = null,
     /// name of benchmark
     name: []const u8,
 };
@@ -553,6 +567,7 @@ const CollectConfigInternal = struct {
     compare_file: ?[]const u8 = null,
     compare_sampler: ?*Sampler = null,
     file_name_out_buffer: ?[]u8 = null,
+    out_measurments: ?*Measurements = null,
     name: []const u8,
 };
 
@@ -624,7 +639,7 @@ const perf_measurements = [_]PerfMeasurement{
     .{ .name = "branch_misses", .config = PERF.COUNT.HW.BRANCH_MISSES },
 };
 
-const Measurements = struct {
+pub const Measurements = struct {
     wall_time: Measurement,
     max_rss: Measurement,
     cpu_cycles: Measurement,
