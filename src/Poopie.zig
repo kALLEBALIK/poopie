@@ -124,7 +124,7 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
                 local_prints,
             );
 
-            inline for (@typeInfo(Measurements).Struct.fields) |field| {
+            inline for (@typeInfo(Measurements).@"struct".fields) |field| {
                 const measurement = @field(compare_measurement, field.name);
                 try printMeasurement(sampler.tty_conf, stdout_w, measurement, field.name, null, 1);
             }
@@ -150,7 +150,7 @@ pub fn collect(self: *Poopie, allocator: Allocator, sampler: *Sampler, collect_c
             maybe_compare_measurement != null,
             local_prints,
         );
-        inline for (@typeInfo(Measurements).Struct.fields) |field| {
+        inline for (@typeInfo(Measurements).@"struct".fields) |field| {
             const measurement = @field(measurements, field.name);
             const first_measurement = if (maybe_compare_measurement) |compare_measurement| blk: {
                 break :blk @field(compare_measurement, field.name);
@@ -174,7 +174,7 @@ pub fn createInternalConfig(poopie_config: PoopieConfig, collect_config: Collect
         .compare_file = collect_config.compare_file,
         .name = collect_config.name,
     };
-    inline for (@typeInfo(PoopieConfig).Struct.fields) |field| {
+    inline for (@typeInfo(PoopieConfig).@"struct".fields) |field| {
         const field_value = @field(poopie_config, field.name);
         if (@hasField(CollectConfigInternal, field.name)) {
             if (field_value) |value| {
@@ -182,10 +182,10 @@ pub fn createInternalConfig(poopie_config: PoopieConfig, collect_config: Collect
             }
         }
     }
-    inline for (@typeInfo(CollectConfig).Struct.fields) |field| {
+    inline for (@typeInfo(CollectConfig).@"struct".fields) |field| {
         const field_value = @field(collect_config, field.name);
         if (@hasField(CollectConfigInternal, field.name)) {
-            if (@typeInfo(field.type) == .Optional and field_value != null) {
+            if (@typeInfo(field.type) == .optional and field_value != null) {
                 @field(internal, field.name) = field_value.?;
             }
         }
@@ -401,30 +401,32 @@ pub const Sampler = struct {
 
         self.renderBar(progress.EscapeCodes.yellow);
 
-        for (perf_measurements, &self.perf_fds) |measurement, *perf_fd| {
-            var attr: std.os.linux.perf_event_attr = .{
-                .type = PERF.TYPE.HARDWARE,
-                .config = @intFromEnum(measurement.config),
-                .flags = .{
-                    .disabled = true,
-                    .exclude_kernel = true,
-                    .exclude_hv = true,
-                    .inherit = true,
-                    .enable_on_exec = false,
-                },
-            };
+        // Linux specific
+        if (builtin.target.os.tag == .linux) {
+            for (perf_measurements, &self.perf_fds) |measurement, *perf_fd| {
+                var attr: std.os.linux.perf_event_attr = .{
+                    .type = PERF.TYPE.HARDWARE,
+                    .config = @intFromEnum(measurement.config),
+                    .flags = .{
+                        .disabled = true,
+                        .exclude_kernel = true,
+                        .exclude_hv = true,
+                        .inherit = true,
+                        .enable_on_exec = false,
+                    },
+                };
 
-            perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, self.perf_fds[0], PERF.FLAG.FD_NO_GROUP) catch |err| {
-                std.debug.panic("unable to open perf event: {s}\n", .{@errorName(err)});
-            };
-            _ = std.os.linux.ioctl(perf_fd.*, PERF.EVENT_IOC.ENABLE, @intFromPtr(perf_fd));
+                perf_fd.* = std.posix.perf_event_open(&attr, 0, -1, self.perf_fds[0], PERF.FLAG.FD_NO_GROUP) catch |err| {
+                    std.debug.panic("unable to open perf event: {s}\n", .{@errorName(err)});
+                };
+                _ = std.os.linux.ioctl(perf_fd.*, PERF.EVENT_IOC.ENABLE, @intFromPtr(perf_fd));
+            }
+
+            var rusage: std.os.linux.rusage = undefined;
+            self.start_rss = if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &rusage) == 0) @as(u64, @intCast(rusage.maxrss)) * 1024 else 0;
+            _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
+            _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.ENABLE, PERF.IOC_FLAG_GROUP);
         }
-
-        var rusage: std.os.linux.rusage = undefined;
-        self.start_rss = if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &rusage) == 0) @as(u64, @intCast(rusage.maxrss)) * 1024 else 0;
-
-        _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.RESET, PERF.IOC_FLAG_GROUP);
-        _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.ENABLE, PERF.IOC_FLAG_GROUP);
 
         self.start_ns = self.timer.read();
 
@@ -434,11 +436,15 @@ pub const Sampler = struct {
     /// Store sample
     pub fn store(self: *Sampler) void {
         const end_ns = self.timer.read() - self.start_ns;
-        _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
 
-        var rusage: std.os.linux.rusage = undefined;
-        const rss_now = if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &rusage) == 0) @as(u64, @intCast(rusage.maxrss)) * 1024 else 0;
-        const rss = if (rss_now <= self.start_rss) 0 else rss_now - self.start_rss;
+        // Linux specific
+        var rss: u64 = 0;
+        if (builtin.target.os.tag == .linux) {
+            _ = std.os.linux.ioctl(self.perf_fds[0], PERF.EVENT_IOC.DISABLE, PERF.IOC_FLAG_GROUP);
+            var rusage: std.os.linux.rusage = undefined;
+            const rss_now = if (std.os.linux.getrusage(std.os.linux.rusage.SELF, &rusage) == 0) @as(u64, @intCast(rusage.maxrss)) * 1024 else 0;
+            rss = if (rss_now <= self.start_rss) 0 else rss_now - self.start_rss;
+        }
 
         // Warmup
         if (self.cur_warmup < self.sample_config.warmups) {
@@ -463,9 +469,12 @@ pub const Sampler = struct {
             .cache_misses = readPerfFd(self.perf_fds[3]),
             .branch_misses = readPerfFd(self.perf_fds[4]),
         };
-        for (&self.perf_fds) |*perf_fd| {
-            std.posix.close(perf_fd.*);
-            perf_fd.* = -1;
+        // linux specific
+        if (builtin.target.os.tag == .linux) {
+            for (&self.perf_fds) |*perf_fd| {
+                std.posix.close(perf_fd.*);
+                perf_fd.* = -1;
+            }
         }
 
         self.updateBarEstimation(self.cur_sample, self.sample_config.samples, self.first_start_ns);
@@ -616,10 +625,15 @@ fn parseFileName(file_name: []const u8, data: *FileNameData) !void {
 fn readPerfFd(fd: fd_t) usize {
     var result: usize = 0;
     const n = std.posix.read(fd, std.mem.asBytes(&result)) catch |err| {
-        if (builtin.mode == .Debug) {
-            std.debug.panic("unable to read perf fd: {s}\n", .{@errorName(err)});
-        } else {
-            return 0;
+        switch (builtin.target.os.tag) {
+            .linux => {
+                if (builtin.mode == .Debug) {
+                    std.debug.panic("unable to read perf fd: {s}\n", .{@errorName(err)});
+                } else {
+                    return 0;
+                }
+            },
+            inline else => return 0,
         }
     };
     assert(n == @sizeOf(usize));

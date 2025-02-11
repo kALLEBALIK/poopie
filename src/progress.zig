@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const Spinner = struct {
     const Self = @This();
@@ -36,7 +37,19 @@ const Winsize = extern struct {
 
 pub fn getScreenWidth(stdout: std.posix.fd_t) usize {
     var winsize: Winsize = undefined;
-    _ = std.os.linux.ioctl(stdout, TIOCGWINSZ, @intFromPtr(&winsize));
+    switch (builtin.target.os.tag) {
+        // .linux => {
+        //     _ = std.os.linux.ioctl(stdout, TIOCGWINSZ, @intFromPtr(&winsize));
+        // },
+        .linux, .macos => {
+            _ = std.posix.system.ioctl(
+                stdout,
+                TIOCGWINSZ,
+                @intFromPtr(&winsize),
+            );
+        },
+        inline else => @panic("Invalid target"),
+    }
     return @intCast(winsize.ws_col);
 }
 
@@ -66,6 +79,7 @@ pub const ProgressBar = struct {
     pub fn init(allocator: std.mem.Allocator, stdout: std.fs.File) !Self {
         const width = getScreenWidth(stdout.handle);
         const buf = try std.ArrayList(u8).initCapacity(allocator, width + WIDTH_PADDING);
+
         return Self{
             .spinner = Spinner.init(),
             .last_rendered = try std.time.Instant.now(),
@@ -93,27 +107,33 @@ pub const ProgressBar = struct {
             try self.buf.resize(width + WIDTH_PADDING);
         }
         var writer = self.buf.writer();
-        const bar_width = width - Spinner.frame1.len - " 10000 runs ".len - " 100% ".len;
-        const prog_len = (bar_width * 2) * self.current / self.estimate;
-        const full_bars_len: usize = @intCast(prog_len / 2);
 
         try writer.print("{s}{s}{s} {d: >5} runs ", .{ color, self.spinner.get(), EscapeCodes.reset, self.current });
         self.spinner.next();
 
-        try writer.print("{s}", .{color}); // pink
-        for (0..full_bars_len) |_| {
-            try writer.print(bar, .{});
+        // TODO: This does not work on mac.
+        // so if it isn't linux we only use spinner.
+        if (builtin.target.os.tag == .linux) {
+            const bar_width = width - Spinner.frame1.len - " 10000 runs ".len - " 100% ".len;
+            const prog_len = (bar_width * 2) * self.current / self.estimate;
+            const full_bars_len: usize = @intCast(prog_len / 2);
+
+            try writer.print("{s}", .{color}); // pink
+            for (0..full_bars_len) |_| {
+                try writer.print(bar, .{});
+            }
+            if (prog_len % 2 == 1) {
+                try writer.print(half_bar_left, .{});
+            }
+            try writer.print("{s}{s}", .{ EscapeCodes.white, EscapeCodes.dim }); // white
+            if (prog_len % 2 == 0) {
+                try writer.print(half_bar_right, .{});
+            }
+            for (0..(bar_width - full_bars_len - 1)) |_| {
+                try writer.print(bar, .{});
+            }
         }
-        if (prog_len % 2 == 1) {
-            try writer.print(half_bar_left, .{});
-        }
-        try writer.print("{s}{s}", .{ EscapeCodes.white, EscapeCodes.dim }); // white
-        if (prog_len % 2 == 0) {
-            try writer.print(half_bar_right, .{});
-        }
-        for (0..(bar_width - full_bars_len - 1)) |_| {
-            try writer.print(bar, .{});
-        }
+
         try writer.print("{s}", .{EscapeCodes.reset}); // reset
         try writer.print(" {d: >3.0}% ", .{
             @as(f64, @floatFromInt(self.current)) * 100 / @as(f64, @floatFromInt(self.estimate)),
